@@ -1,60 +1,125 @@
 package main
 
 import (
-	"CrawlerBot/internal/models"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"log"
 	"net/http"
+	"sync"
 )
 
-const source = "https://lenta.ru/rss/news/russia"
-
 func main() {
-	response, err := getResponse()
+	// парсинг RSS
+	items, err := parser.ParseRSS()
 	if err != nil {
-		fmt.Println(err)
+		log.Print(err)
 		return
 	}
 
-	err = parseResponse(response)
+	// создаем клиент для подключения к базе
+	cl, err := esdb.NewClient()
 	if err != nil {
-		fmt.Println(err)
+		log.Println(err)
 		return
 	}
-}
 
-func getResponse() ([]byte, error) {
-	resp, err := http.Get(source)
-	if resp.StatusCode != http.StatusOK {
-		fmt.Println(resp.Status)
-		return nil, errors.New("wrong status code")
-	}
+	db := esdb.NewDatabase(cl)
+	/////// убрать
+	err = db.GetInfo()
 	if err != nil {
-		return nil, err
+		log.Println(err)
+		return
 	}
-	defer resp.Body.Close()
+	///////
 
-	data, err := ioutil.ReadAll(resp.Body)
+	// создаем индкс и маппинг
+	err = db.PutIndex()
 	if err != nil {
-		return nil, err
+		log.Println(err)
+		return
 	}
 
-	return data, nil
-}
-
-func parseResponse(data []byte) error {
-	var rss models.RSS
-
-	err := xml.Unmarshal(data, &rss)
+	// функция нахождения дупликатов статей
+	// возвращает список не скачанных статей
+	notDownloaded, err := db.FindDuplicates(items...)
 	if err != nil {
-		return err
+		log.Println(err)
+		return
 	}
 
-	for _, item := range rss.Channel.Item {
-		fmt.Printf("%+v\n\n", item)
+	repoItems := make([]models.RepoItem, 0)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	// в цикле скачиваем статьи
+	for _, item := range notDownloaded {
+		wg.Add(1)
+
+		it := item
+
+		// скачиваем многопоточно - разбиваем на горутины (потоки)
+		go func() {
+			defer wg.Done()
+
+			// СКАЧИВАЕТ И ПАРСИТ СТАТЬЮ
+			article, err := parser.ParseArticle(it.Link)
+			if err != nil {
+				return
+			}
+
+			mu.Lock()
+			repoItems = append(repoItems, models.FillRepoItem(it, article))
+			mu.Unlock()
+		}()
+
+
+		wg.Wait()
 	}
 
-	return nil
+	// печатает новые скачанные ссылки статей
+	for _, art := range repoItems {
+		fmt.Println("Downloaded one more article: ", art.Link)
+	}
+
+	// запихиваем новые статьи в базу эластик
+	err = db.FillDatabaseWithItems(repoItems...)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	//-----------------
+
+	//функция полнотекстового поиска - ищем по слову, передаваемому в функу
+	err = db.SearchByKey("бесы")
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	err = db.TermAggregationByField("title")
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	err = db.CardinalityAggregationByField("title")
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	err = db.CardinalityAggregationByField("pubdate")
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	err = db.DateHistogramAggregation()
+	if err != nil {
+		log.Println(err)
+		return
+	}
 }
